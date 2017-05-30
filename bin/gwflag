@@ -269,7 +269,7 @@ with  open(ininame,'w') as FILE:
 
     for i  in range(0,len(thresh)):
         context = {
-          "th":thresh[i],
+          "th":str(args.threshold[i]).replace('.', '_'),
           "chan":allchannels[0],
           "ifo":args.ifo,
           "xml":os.path.join(args.output_dir,segxml)
