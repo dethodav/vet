@@ -17,5 +17,264 @@
 ## You should have received a copy of the GNU General Public License
 ## along with GWpy VET.  If not, see <http://www.gnu.org/licenses/>.
 
+"""Creation of one or more data-quality flags.
+This utility creates a given flag, or set of flags,
+based on a number of pre-defined thresholds and flag types.
+All of the command-line options can be given through the configuration files
+with the named sections (given in the section headings in --help), while any
+arguments given explicitly on the command-line take precedence.
+"""
 
+import os.path
+import re
+import warnings
+from StringIO import StringIO
+
+from gwdetchar import (cli, const, scattering, __version__)
+
+import matplotlib
+matplotlib.use('Agg')
+from glue import segments
+from gwpy.timeseries import TimeSeriesDict
+from gwpy.segments import (DataQualityFlag, DataQualityDict,
+                            Segment, SegmentList)
+from gwpy.utils import gprint
+import numpy
+
+parser = cli.create_parser(description=__doc__)
+cli.add_gps_start_stop_arguments(parser)
+cli.add_ifo_option(parser)
+
+parser.add_argument('-c', '--main-channel',
+                    default='%s:GDS-CALIB_STRAIN' % const.IFO,
+                    help='name of main (h(t)) channel, default: %(default)s')
+parser.add_argument('-t', '--threshold', nargs='+', default=40.,
+                    help='critical fringe frequency threshold (in Hertz), '
+                         'default: 10')
+parser.add_argument('-e', '--threshold-multiplier', type=int, default=0,
+                    help='power of 10 for threshold, '
+                         'default: 0')
+parser.add_argument('-a', '--state-flag', metavar='FLAG',
+                    default='%s:DMT-ANALYSIS_READY:1' % const.IFO,
+                    help='restrict search to times when FLAG was active')
+parser.add_argument('-lp', '--lowpass', type=int,
+                    help='lowpass threshold')
+parser.add_argument('-hp', '--highpass', type=int,
+                    help='highpass threshold')
+parser.add_argument('--rms', type=float,
+                    help='Seconds in each root-mean-square calculation')
+parser.add_argument('-sf', '--segment-end-pad', type=int, default=0,
+                    help='amount of time to add to the end of each segment')
+parser.add_argument('-si', '--segment-start-pad', type=int, default=0,
+                    help='amount of time to add to the start of each segment')
+parser.add_argument('-o', '--output-dir', type=os.path.abspath,
+                    default=os.curdir,
+                    help='output directory for analysis, default: %(default)s')
+cli.add_frametype_option(parser, default='%s_R' % const.IFO)
+parser.add_argument('-m', '--flag-method',
+                    default='timeseries',
+                    help='method of flag production: %(default)s')
+parser.add_argument('-v', '--verbose', action='store_true', default=False,
+                    help='print verbose output, default: %(default)s')
+cli.add_nproc_option(parser)
+
+
+args = parser.parse_args()
+
+
+if len(args.threshold) == 1:
+    try:  # try converting to GPS
+        args.threshold = [float(args.threshold[0])]
+    except (TypeError, ValueError):  # otherwise read as file
+        import numpy
+        args.threshold = numpy.loadtxt(args.threshold[0], dtype=float)
+else:
+    args.threshold = map(float, args.threshold)
+
+chanstr = str(args.main_channel).replace(':', '_')
+gpsstr = '%s-%s' % (int(args.gpsstart), int(args.gpsend-args.gpsstart))
+
+
+for k in range(0,len(args.threshold)):
+    if args.threshold[k].is_integer():
+        args.threshold[k] = int(args.threshold[k])
+
+if not os.path.isdir(args.output_dir):
+    os.makedirs(args.output_dir)
+os.chdir(args.output_dir)
+
+
+segxml = '%s-FLAG_SEGMENTS-%s.xml.gz' % (chanstr, gpsstr)
+
+# -- get state segments -------------------------------------------------------
+
+span = Segment(args.gpsstart, args.gpsend)
+
+# get segments
+if args.state_flag:
+    state = DataQualityFlag.query(args.state_flag, int(args.gpsstart),
+                                  int(args.gpsend), url=const.O1_SEGMENT_SERVER)
+    for i, seg in enumerate(state.active):
+        state.active[i] = type(seg)(seg[0], seg[1])
+    state.coalesce()
+    statea = state.active
+    livetime = float(abs(statea))
+    if args.verbose:
+        gprint("Downloaded %d segments for %s [%.2fs livetime]"
+               % (len(statea), args.state_flag, livetime))
+else:
+    statea = SegmentList([span])
+
+
+# -- download segments -------------------------------------------------
+
+
+
+allchannels = ['%s' % (args.main_channel)]
+
+if (args.flag_method) == 'timeseries' or (args.flag_method) == 'scattering':
+
+    if args.verbose:
+        gprint("Reading all data... 0/%d segments read" % len(statea), end='\r')
+    alldata = []
+    for i, seg in enumerate(statea):
+        alldata.append(
+            TimeSeriesDict.get(allchannels, seg[0], seg[1], nproc=args.nproc,
+                               frametype=args.frametype))
+        if args.verbose:
+            gprint("Reading all data... %d/%d segments read"
+               % (i+1, len(statea)), end='\r')
+    if args.verbose:
+        gprint("Reading all data... {0}/{0} segments read".format(len(statea)))
+    
+    flag_segments = DataQualityDict((m, []) for m in args.threshold)
+
+
+# -- find active times -------------------------------------------------
+
+step = 1
+thresh = args.threshold
+
+if args.verbose:
+    gprint("Checking all thresholds... 0/%d thresholds checked" % len(thresh), end='\r')
+
+
+for i  in range(0,len(thresh)):
+
+
+  # find times above threshold
+  time = []
+
+  if (args.flag_method) == 'timeseries' or (args.flag_method) == 'scattering':
+
+      for j in alldata:
+        data = j[allchannels[0]]
+
+        if (args.flag_method) == 'timeseries':
+            if args.lowpass != None and args.highpass != None:
+                data =  data.bandpass(args.highpass,args.lowpass)
+            elif args.highpass != None:
+                data =  data.highpass(args.highpass)
+            elif args.lowpass != None:
+                data =  data.highpass(args.lowpass)
+            if args.rms != None:
+                data = data.rms(args.rms)
+        if (args.flag_method) == 'scattering':
+            data = scattering.get_fringe_frequency(data)
+
+        all_time = numpy.linspace(int(data.epoch.value), int((data.epoch.value + len(data.value)*data.dt.value)),num=len(data.value))
+        for z in range(0,len(all_time)):
+          if (data.value[z] > (args.threshold[i])*10**(int(args.threshold_multiplier))) :
+             time.append(all_time[z])
+
+
+  # put in to segment list and coalesce
+  segs = segments.segmentlist()
+  segs.extend([segments.segment(int(t), int(t)+step) for t in time])
+  segs = segs.coalesce()
+
+ 
+  # set up the xml file
+  start_time = []
+  start_time.extend([t[0]-(args.segment_start_pad) for t in segs])
+  end_time = []
+  end_time.extend([t[1]+(args.segment_end_pad) for t in segs])
+
+  threshstr = str(args.threshold[i]).replace('.', '_')
+  flag_name = '%s:DCH-%s_%s:1' % (args.ifo,allchannels[0], threshstr)
+
+  # put in to dq flag
+  flag = DataQualityFlag(flag_name, active=zip(start_time,end_time), known=[[args.gpsstart,args.gpsend]])
+
+  # populate dictionary
+  flag_segments[args.threshold[i]] = flag
+
+  if args.verbose:
+        gprint("Checking all thresholds... %d/%d thresholds checked"
+           % (i+1, len(thresh)), end='\r')
+if args.verbose:
+    gprint("Reading all data... {0}/{0} segments read".format(len(thresh)))
+
+print('writing xml')
+
+flag_segments.write(segxml,overwrite=True)
+
+# -- Create .ini file  -------------------------------------------------
+
+
+header = """ [plugins]
+gwvet.tabs =
+
+[states]
+Science = %(ifo)s:DMT-ANALYSIS_READY:1
+
+[segment-database]
+url = https://segments.ligo.org
+
+[omicron]
+columns = time,snr,peak_frequency
+ligolw_columns = peak_time,peak_time_ns,snr,peak_frequency
+
+[DEFAULT]
+type = veto-flag
+event-channel = %(ifo)s:GDS-CALIB_STRAIN
+event-generator = Omicron
+metrics = 'Deadtime',
+          'Efficiency',
+          'Efficiency/Deadtime,
+          'Efficiency | SNR>=8',
+          'Efficiency/Deadtime | SNR>=8',
+          'Efficiency | SNR>=20',
+          'Efficiency/Deadtime | SNR>=20',
+          'Efficiency | SNR>=100',
+          'Efficiency/Deadtime | SNR>=100',
+          'Use percentage',
+          'Loudest event by SNR'
+
+"""
+
+template = """[tab-{th}]
+name = {chan} {th}
+shortname = {th}
+flags = {ifo}:DCH-{chan}_{th}:1
+states = Science
+segmentfile = {xml}
+
+"""
+
+ininame = '%s-FLAG_SEGMENTS-%s.ini' % (chanstr, gpsstr)
+
+with  open(ininame,'w') as FILE:
+    FILE.write(header.format())
+
+    for i  in range(0,len(thresh)):
+        context = {
+          "th":thresh[i],
+          "chan":allchannels[0],
+          "ifo":args.ifo,
+          "xml":os.path.join(args.output_dir,segxml)
+          }
+        FILE.write(template.format(**context))
+
+#FILE.close()
 
