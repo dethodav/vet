@@ -9,7 +9,7 @@
 ## the Free Software Foundation, either version 3 of the License, or
 ## (at your option) any later version.
 ##
-## GWSumm is distributed in the hope that it will be useful,
+## GWpy VET is distributed in the hope that it will be useful,
 ## but WITHOUT ANY WARRANTY; without even the implied warranty of
 ## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 ## GNU General Public License for more details.
@@ -48,9 +48,9 @@ cli.add_ifo_option(parser)
 parser.add_argument('-c', '--main-channel',
                     default='%s:GDS-CALIB_STRAIN' % const.IFO,
                     help='name of main (h(t)) channel, default: %(default)s')
-parser.add_argument('-t', '--threshold', nargs='+', default=40.,
-                    help='critical fringe frequency threshold (in Hertz), '
-                         'default: 10')
+parser.add_argument('-t', '--threshold', nargs='+', default=100.,
+                    help='threshold, or list of thresholds, to produce flags with, '
+                         ' (unit depends on method and channel choice)')
 parser.add_argument('-e', '--threshold-multiplier', type=int, default=0,
                     help='power of 10 for threshold, '
                          'default: 0')
@@ -71,9 +71,9 @@ parser.add_argument('-o', '--output-dir', type=os.path.abspath,
                     default=os.curdir,
                     help='output directory for analysis, default: %(default)s')
 cli.add_frametype_option(parser, default='%s_R' % const.IFO)
-parser.add_argument('-m', '--flag-method',
-                    default='timeseries',
-                    help='method of flag production: %(default)s')
+parser.add_argument('-m', '--flag-method', default-'timeseries',
+                    help='default method of flag production. '
+                         'other options include timeseries, scattering, omicron')
 parser.add_argument('-v', '--verbose', action='store_true', default=False,
                     help='print verbose output, default: %(default)s')
 cli.add_nproc_option(parser)
@@ -133,7 +133,6 @@ else:
 allchannels = ['%s' % (args.main_channel)]
 
 if (args.flag_method) == 'timeseries' or (args.flag_method) == 'scattering':
-
     if args.verbose:
         gprint("Reading all data... 0/%d segments read" % len(statea), end='\r')
     alldata = []
@@ -146,9 +145,12 @@ if (args.flag_method) == 'timeseries' or (args.flag_method) == 'scattering':
                % (i+1, len(statea)), end='\r')
     if args.verbose:
         gprint("Reading all data... {0}/{0} segments read".format(len(statea)))
-    
-    flag_segments = DataQualityDict((m, []) for m in args.threshold)
 
+elif (args.flag_method) == 'omicron':
+    files = find_trigger_files(channel[0], 'omicron',int(args.gpsstart),int(args.gpsend))
+    events = EventTable.read(files, format='ligolw.sngl_burst')
+
+flag_segments = DataQualityDict((m, []) for m in args.threshold)
 
 # -- find active times -------------------------------------------------
 
@@ -166,10 +168,8 @@ for i  in range(0,len(thresh)):
   time = []
 
   if (args.flag_method) == 'timeseries' or (args.flag_method) == 'scattering':
-
       for j in alldata:
         data = j[allchannels[0]]
-
         if (args.flag_method) == 'timeseries':
             if args.lowpass != None and args.highpass != None:
                 data =  data.bandpass(args.highpass,args.lowpass)
@@ -181,12 +181,18 @@ for i  in range(0,len(thresh)):
                 data = data.rms(args.rms)
         if (args.flag_method) == 'scattering':
             data = scattering.get_fringe_frequency(data)
-
-        all_time = numpy.linspace(int(data.epoch.value), int((data.epoch.value + len(data.value)*data.dt.value)),num=len(data.value))
+        all_time = numpy.linspace(int(data.epoch.value), int((data.epoch.value 
+                    + len(data.value)*data.dt.value)),num=len(data.value))
         for z in range(0,len(all_time)):
           if (data.value[z] > (args.threshold[i])*10**(int(args.threshold_multiplier))) :
              time.append(all_time[z])
 
+  elif (args.flag_method) == 'omicron':
+      loud = events['snr'] > int(args.threshold[i])
+      loud_events = events[loud]
+      event_times = loud_events['peak_time']
+      for z in event_times:
+          time.append(z)
 
   # put in to segment list and coalesce
   segs = segments.segmentlist()
@@ -263,10 +269,8 @@ segmentfile = {xml}
 """
 
 ininame = '%s-FLAG_SEGMENTS-%s.ini' % (chanstr, gpsstr)
-
 with  open(ininame,'w') as FILE:
     FILE.write(header.format())
-
     for i  in range(0,len(thresh)):
         context = {
           "th":str(args.threshold[i]).replace('.', '_'),
@@ -275,6 +279,5 @@ with  open(ininame,'w') as FILE:
           "xml":os.path.join(args.output_dir,segxml)
           }
         FILE.write(template.format(**context))
-
-#FILE.close()
+FILE.close()
 
